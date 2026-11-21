@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-variant_runner_safe.py — безопасный самодостаточный раннер вариантов DGM (W/A/F/C/T),
-аудитор инвариантов (неравенство Буля, MCSE) и исправленный калькулятор --quickstart.
+variant_runner_safe.py -- Self-contained runner for alternative DGMs (W/A/F/C/T),
+invariant auditor (Frechet-Boole bounds, MCSE), and --quickstart sample-size planner.
 
-ПОЧЕМУ ЭТОТ ФАЙЛ БЕЗОПАСЕН ДЛЯ ПРОЕКТА:
-  1. Не изменяет существующие модули v1 (sim_core.py, analysis_core.py,
+DESIGN GUARANTEES:
+  1. Does not modify the baseline simulation modules (sim_core.py, analysis_core.py,
      scenarios_simulation.py, grid_runner.py, p5_drop_early.py, p6_time_ratio.py).
-  2. Пишет результаты в отдельную папку variant_output_safe/ (или в VAR_OUT_DIR).
-  3. Исправляет все ошибки аудита:
-     - Единый словарь столбцов ENDPOINT_COLS (совпадает с ss.HYP: H1a, H2a_EL, H2b_GL, H3).
-     - --quickstart учитывает ВСЕ 4 пилотных эффекта (HR, d_EL, d_GL, d_trans).
-     - Множитель kappa применяется и для варианта C; --calibrate проверяет границы бисекции.
-     - Автопроверка неравенства Буля, MCSE по каждой гипотезе, агрегация v2 и PP.
-     - Флаг --zero-solver off позволяет отключить искусственного zero_solver.
-     - Чёткая диагностика отсутствующих файлов проекта vs отсутствующих pip-пакетов.
+  2. Writes outputs to a dedicated directory: variant_output_safe/ (or VAR_OUT_DIR).
+  3. Enforces methodological and numerical safeguards:
+     - Unified column map ENDPOINT_COLS matching ss.HYP (H1a, H2a_EL, H2b_GL, H3).
+     - --quickstart incorporates all four pilot effect sizes (HR, d_EL, d_GL, d_trans).
+     - Scalar multiplier kappa applies across all alternative variants (including C),
+       and --calibrate verifies bisection brackets before solving.
+     - Automated Frechet-Boole checks, per-endpoint MCSE, v2 jackknife, and PP summaries.
+     - --zero-solver off allows disabling the baseline zero_solver rule globally.
+     - Clear diagnostics separating missing project .py files from missing Python packages.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from scipy.special import expit, logit, ndtr
 from scipy.stats import t as _student_t
 
 # ---------------------------------------------------------------------------
-# 0. Константы и единая схема имён столбцов
+# 0. Constants and unified column schema
 # ---------------------------------------------------------------------------
 HERE: Path = Path(__file__).resolve().parent
 OUT_DIR_SAFE: Path = Path(
@@ -47,7 +48,7 @@ TOL: float = 1e-9
 ALL_VARIANTS: tuple[str, ...] = ("base", "W", "A", "F", "C", "T")
 VALID_ALT_VARIANTS: tuple[str, ...] = ("W", "A", "F", "C", "T")
 
-# Форма Weibull: log-SD = pi / (sqrt(6) * k) = 0.45 => k = pi / (sqrt(6) * 0.45)
+# Weibull shape: log-SD = pi / (sqrt(6) * k) = 0.45 => k = pi / (sqrt(6) * 0.45)
 WEIBULL_K: float = float(np.pi / (np.sqrt(6.0) * 0.45))
 
 VARIANT_DEFAULTS: dict[str, dict[str, float]] = {
@@ -59,7 +60,7 @@ VARIANT_DEFAULTS: dict[str, dict[str, float]] = {
     "T": {"df": 4.0},
 }
 
-# Единый словарь соответствия гипотез столбцам grid_summary.csv (строго по ss.HYP)
+# Unified mapping from endpoints to grid_summary.csv columns (matching ss.HYP)
 ENDPOINT_COLS: dict[str, str] = {
     "H1a": "v3_pow_H1a",
     "H2a_EL": "v3_pow_H2a_EL",
@@ -74,7 +75,7 @@ _PROJECT_MODULES: dict[str, ModuleType] | None = None
 
 
 def load_project_modules() -> dict[str, ModuleType]:
-    """Лениво импортирует модули проекта, отличая отсутствие .py от нехватки pip-библиотек."""
+    """Lazily import project modules, separating missing .py files from missing pip packages."""
     global _PROJECT_MODULES
     if _PROJECT_MODULES is not None:
         return _PROJECT_MODULES
@@ -91,11 +92,11 @@ def load_project_modules() -> dict[str, ModuleType]:
         "grid_runner",
     )
 
-    # Сначала проверяем наличие самих .py файлов рядом со скриптом
+    # First check that the required .py files exist next to this script
     missing_files = [f"{name}.py" for name in required if not (HERE / f"{name}.py").exists()]
     if missing_files:
         raise FileNotFoundError(
-            f"В папке {HERE} не найдены файлы проекта: {', '.join(missing_files)}"
+            f"Required project files not found in {HERE}: {', '.join(missing_files)}"
         )
 
     loaded: dict[str, ModuleType] = {}
@@ -104,8 +105,8 @@ def load_project_modules() -> dict[str, ModuleType]:
             loaded[mod_name] = __import__(mod_name)
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError(
-                f"Файл {mod_name}.py найден, но в активном Python не установлена "
-                f"библиотека '{exc.name}'. Установите пакеты: "
+                f"Found {mod_name}.py, but the active Python environment is missing "
+                f"package '{exc.name}'. Install dependencies with: "
                 "pip install numpy pandas scipy statsmodels matplotlib"
             ) from exc
 
@@ -114,12 +115,12 @@ def load_project_modules() -> dict[str, ModuleType]:
 
 
 # ---------------------------------------------------------------------------
-# 1. Математические преобразования и генератор DGM (исправленный sim_alt)
+# 1. Distribution transforms and alternative DGM generator
 # ---------------------------------------------------------------------------
 def weibull_mult(z_std: np.ndarray | float, k: float = WEIBULL_K) -> np.ndarray | float:
-    """Преобразует z_std ~ N(0, 1) в Weibull-множитель с медианой 1 и SD(log) = pi/(sqrt(6)*k)."""
+    """Transform z_std ~ N(0, 1) into a Weibull multiplier with median 1 and SD(log) = pi/(sqrt(6)*k)."""
     if k <= 0.0:
-        raise ValueError(f"Параметр формы k должен быть > 0, получено {k}")
+        raise ValueError(f"Weibull shape parameter k must be > 0, got {k}")
     u = np.clip(ndtr(z_std), 1e-12, 1.0 - 1e-12)
     return (np.log(2.0)) ** (-1.0 / k) * (-np.log1p(-u)) ** (1.0 / k)
 
@@ -127,11 +128,11 @@ def weibull_mult(z_std: np.ndarray | float, k: float = WEIBULL_K) -> np.ndarray 
 def studentt_mult(
     z_std: np.ndarray | float, df: float, target_log_sd: float
 ) -> np.ndarray | float:
-    """Преобразует z_std ~ N(0, 1) в exp(t_df * scale) с заданным log-SD и тяжёлыми хвостами."""
+    """Transform z_std ~ N(0, 1) into exp(t_df * scale) with unit median and target log-SD."""
     if df <= 2.0:
-        raise ValueError(f"df должен быть > 2 (иначе дисперсия t бесконечна), получено {df}")
+        raise ValueError(f"df must be > 2 (otherwise t variance is infinite), got {df}")
     if target_log_sd <= 0.0:
-        raise ValueError(f"target_log_sd должен быть > 0, получено {target_log_sd}")
+        raise ValueError(f"target_log_sd must be > 0, got {target_log_sd}")
     u = np.clip(ndtr(z_std), 1e-12, 1.0 - 1e-12)
     t_val = _student_t.ppf(u, df=df)
     sd_t = float(np.sqrt(df / (df - 2.0)))
@@ -146,8 +147,8 @@ def generate_dataset_safe(
     kappa: float = 1.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     """
-    Генерирует синтетический датасет для выбранного варианта DGM.
-    Для variant == "base" делегирует в sim_core.generate_dataset (бит-в-бит v1).
+    Generate a synthetic dataset for the selected DGM variant.
+    When variant == "base", delegates directly to sim_core.generate_dataset (bit-for-bit identical).
     """
     mods = load_project_modules()
     sc = mods["sim_core"]
@@ -155,9 +156,9 @@ def generate_dataset_safe(
     if variant == "base":
         return sc.generate_dataset(seed=seed, params=params)
     if variant not in VALID_ALT_VARIANTS:
-        raise ValueError(f"Неизвестный variant: {variant!r}. Допустимы: {ALL_VARIANTS}")
+        raise ValueError(f"Unknown variant: {variant!r}. Allowed values: {ALL_VARIANTS}")
     if kappa <= 0.0 or not np.isfinite(kappa):
-        raise ValueError(f"kappa должен быть конечным числом > 0, получено {kappa}")
+        raise ValueError(f"kappa must be a finite number > 0, got {kappa}")
 
     return _generate_variant_impl(sc, seed, params, variant, vp or {}, float(kappa))
 
@@ -170,20 +171,20 @@ def _generate_variant_impl(
     vp: dict[str, float],
     kappa: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Реализация вариантов W/A/F/C/T с сохранением точного порядка RNG из sim_core."""
+    """Implement variants W/A/F/C/T while preserving the exact RNG draw order of sim_core."""
     P = params if params is not None else sc.PARAMS
     vpf: dict[str, float] = {**VARIANT_DEFAULTS[variant], **vp}
     rng = np.random.default_rng(seed)
     n = int(P["n_students"])
     if n <= 0 or n % 2 != 0:
-        raise ValueError(f"n_students должно быть положительным чётным числом, получено {n}")
+        raise ValueError(f"n_students must be a positive even integer, got {n}")
     tasks: list[str] = list(P["tasks"])
 
-    # 1. Базовый тест (Pre-test)
+    # 1. Baseline pre-test score
     ids = np.array([f"ID_{k:02d}" for k in range(1, n + 1)])
     pre = np.clip(np.round(rng.normal(P["pre_mean"], P["pre_sd"], n)), 0, 20).astype(int)
 
-    # 2. Парная рандомизация (точный порядок RNG из sim_core)
+    # 2. Matched-pair randomization (exact RNG order from sim_core)
     order = np.lexsort((rng.random(n), -pre))
     group = np.empty(n, dtype=object)
     pair_id = np.zeros(n, dtype=int)
@@ -196,14 +197,14 @@ def _generate_variant_impl(
         pair_id[a] = pair_id[b] = pair_no
     z = (pre - P["pre_mean"]) / P["pre_sd"]
 
-    # 3. Индивидуальные характеристики
+    # 3. Student-level latent traits and AI uptake
     speed = rng.normal(0, P["speed_sd"], n)
     ability = rng.normal(0, P["ability_sd"], n)
 
     if variant == "F":
         rho = float(vpf["rho"])
         if not -1.0 <= rho <= 1.0:
-            raise ValueError(f"Для варианта F параметр rho должен быть в [-1, 1], получено {rho}")
+            raise ValueError(f"For variant F, rho must lie in [-1, 1], got {rho}")
         a_std = ability / P["ability_sd"]
         s_std = speed / P["speed_sd"]
         speed = P["speed_sd"] * (-rho * a_std + np.sqrt(1.0 - rho ** 2) * s_std)
@@ -216,7 +217,7 @@ def _generate_variant_impl(
     n_viol = int(P["n_protocol_violators"])
     if not 0 <= n_viol <= len(eg_idx):
         raise ValueError(
-            f"n_protocol_violators={n_viol} выходит за число участников EG ({len(eg_idx)})"
+            f"n_protocol_violators={n_viol} exceeds number of EG students ({len(eg_idx)})"
         )
     violators = rng.choice(eg_idx, size=n_viol, replace=False)
     protocol_violation = np.zeros(n, dtype=int)
@@ -229,7 +230,7 @@ def _generate_variant_impl(
     else:
         a_scale = np.full(n, kappa, dtype=float)
 
-    # 4. Основной раунд (40 минут, 4 задачи)
+    # 4. Main debugging session (40 minutes, 4 tasks)
     rows: list[dict[str, Any]] = []
     for i in range(n):
         g = str(group[i])
@@ -327,7 +328,7 @@ def _generate_variant_impl(
             extra = rng.negative_binomial(k_disp, k_disp / (k_disp + extra_mean))
             attempts = 1 + int(extra)
 
-            # Защита от 0 секунд в левом хвосте Student-t (иначе ln(0)=-inf роняет ANCOVA)
+            # Floor at 1 second to prevent ln(0) = -inf in extreme left tails of Student-t
             sec = max(1, int(round(t_spent * 60)))
             rows.append(
                 dict(
@@ -344,7 +345,7 @@ def _generate_variant_impl(
                 )
             )
 
-    # 5. Сборка таблиц задач и студентов (идентично sim_core.py)
+    # 5. Assemble task-level and student-level tables (identical to sim_core.py)
     tasks_df = pd.DataFrame(rows)
     info = pd.DataFrame({"student_id": ids, "group": group, "pair_id": pair_id})
     tasks_df = tasks_df.merge(info, on="student_id")
@@ -438,12 +439,12 @@ def _generate_variant_impl(
 
 
 # ---------------------------------------------------------------------------
-# 2. Валидация инвариантов (неравенство Буля, границы калибровки)
+# 2. Invariant validators (Frechet-Boole bounds, calibration brackets)
 # ---------------------------------------------------------------------------
 def check_boole_row(
     row: dict[str, Any] | pd.Series, prefix: str = "v3", tol: float = 1e-12
 ) -> str | None:
-    """Проверяет неравенство Буля для одной строки сводной таблицы."""
+    """Verify Frechet-Boole probability bounds for a single summary row."""
     pow_cols = [f"{prefix}_pow_{h}" for h in HYP_COL_SUFFIXES]
     joint_col = f"{prefix}_joint"
     if not all(c in row for c in (*pow_cols, joint_col)):
@@ -451,14 +452,14 @@ def check_boole_row(
     p_vals = np.array([float(row[c]) for c in pow_cols], dtype=float)
     p_joint = float(row[joint_col])
     if np.any(np.isnan(p_vals)) or np.isnan(p_joint):
-        return f"{row.get('name', '?')} ({prefix}): обнаружен NaN в столбцах мощности"
+        return f"{row.get('name', '?')} ({prefix}): NaN detected in power columns"
 
     upper = float(np.min(p_vals))
     lower = float(max(0.0, 1.0 - np.sum(1.0 - p_vals)))
     if not (lower - tol <= p_joint <= upper + tol):
         return (
-            f"{row.get('name', '?')} ({prefix}): joint={p_joint:.4f} вне границ Буля "
-            f"[{lower:.4f}, {upper:.4f}] при p={np.round(p_vals, 4).tolist()}"
+            f"{row.get('name', '?')} ({prefix}): joint={p_joint:.4f} outside Frechet-Boole "
+            f"bounds [{lower:.4f}, {upper:.4f}] for p={np.round(p_vals, 4).tolist()}"
         )
     return None
 
@@ -466,7 +467,7 @@ def check_boole_row(
 def check_boole_dataframe(
     df: pd.DataFrame, prefixes: Sequence[str] = ("v3", "v2", "v1"), tol: float = 1e-12
 ) -> list[str]:
-    """Проверяет неравенство Буля по всем строкам и доступным пайплайнам DataFrame."""
+    """Verify Frechet-Boole bounds across all rows and available pipelines in a DataFrame."""
     errors: list[str] = []
     found_any = False
     for pref in prefixes:
@@ -479,9 +480,9 @@ def check_boole_dataframe(
                     errors.append(msg)
     if not found_any:
         raise KeyError(
-            "В таблице не найдены ожидаемые столбцы мощностей "
-            f"(например, {ENDPOINT_COLS['H1a']} .. {ENDPOINT_COLS['joint']}). "
-            f"Доступные столбцы: {list(df.columns)[:12]}"
+            "Expected power columns not found in table "
+            f"(e.g., {ENDPOINT_COLS['H1a']} .. {ENDPOINT_COLS['joint']}). "
+            f"Available columns: {list(df.columns)[:12]}"
         )
     return errors
 
@@ -489,17 +490,17 @@ def check_boole_dataframe(
 def check_calibration_bracket(
     hr_lo: float, hr_hi: float, target: float, lo: float, hi: float
 ) -> None:
-    """Гарантирует, что целевой HR лежит внутри интервала бисекции."""
+    """Ensure the target HR lies inside the bisection search bracket."""
     if not (min(hr_lo, hr_hi) <= target <= max(hr_lo, hr_hi)):
         raise ValueError(
-            f"Целевой HR={target:.4f} вне интервала бисекции "
+            f"Target HR={target:.4f} is outside bisection bracket "
             f"[HR(lo={lo:.3f})={hr_lo:.4f}, HR(hi={hi:.3f})={hr_hi:.4f}]. "
-            "Измените диапазон или параметры варианта."
+            "Adjust the search range or variant parameters."
         )
 
 
 # ---------------------------------------------------------------------------
-# 3. Расширенная сводка ячейки
+# 3. Extended cell summary with MCSE, v2, PP, and Boole verification
 # ---------------------------------------------------------------------------
 def _mcse_prop(p: float, n: int) -> float:
     if n <= 0 or np.isnan(p) or not (0.0 <= p <= 1.0):
@@ -510,7 +511,7 @@ def _mcse_prop(p: float, n: int) -> float:
 def summarize_cell_safe(
     cell: dict[str, Any], df: pd.DataFrame, truth: dict[str, float]
 ) -> dict[str, Any]:
-    """Собирает метрики ячейки с проверкой неравенства Буля, MCSE, v2 и PP."""
+    """Aggregate cell-level performance metrics with Boole verification, MCSE, v2, and PP."""
     mods = load_project_modules()
     ss = mods["scenarios_simulation"]
 
@@ -562,7 +563,7 @@ def summarize_cell_safe(
 
         err = check_boole_row(out, prefix=pipe)
         if err is not None:
-            raise AssertionError(f"Нарушение инварианта при агрегации: {err}")
+            raise AssertionError(f"Invariant violation during aggregation: {err}")
 
     out["joint_mcse"] = out.get("v3_joint_mcse", float("nan"))
     out["tost_unpaired"] = float((df_ok["itt_tost_p"] < 0.05).mean()) if n else float("nan")
@@ -643,7 +644,7 @@ def summarize_cell_safe(
 
 
 # ---------------------------------------------------------------------------
-# 4. Реплики и расчёт псевдоистинных значений
+# 4. Replication workers and pseudo-true estimand computation
 # ---------------------------------------------------------------------------
 def _apply_zero_solver_policy(params: dict[str, Any], zero_solver_mode: str) -> dict[str, Any]:
     if zero_solver_mode == "off":
@@ -654,7 +655,7 @@ def _apply_zero_solver_policy(params: dict[str, Any], zero_solver_mode: str) -> 
 def one_rep_variant(
     job: tuple[str, int, float, int, float, float | None, bool, int, str, dict[str, float], float, str]
 ) -> dict[str, Any]:
-    """Одна реплика симуляции (top-level функция для ProcessPoolExecutor на macOS/Linux)."""
+    """Run one simulation replication (top-level function for ProcessPoolExecutor on macOS/Linux)."""
     warnings.filterwarnings("ignore")
     (
         name,
@@ -695,7 +696,7 @@ def one_rep_variant(
 def one_rep_custom_params(
     job: tuple[str, dict[str, Any], int, str, dict[str, float], float]
 ) -> dict[str, Any]:
-    """Одна реплика с явно переданным словарём параметров P (для --quickstart)."""
+    """Run one replication with an explicit parameter dictionary P (used by --quickstart)."""
     warnings.filterwarnings("ignore")
     name, params, seed, variant, vp, kappa = job
     rec: dict[str, Any] = {"scenario": name, "seed": seed}
@@ -750,7 +751,7 @@ def compute_truth_for_params(
     kappa: float,
     seeds: Sequence[int] = (777, 778, 779),
 ) -> dict[str, float]:
-    """Оценивает псевдоистинные параметры на супервыборке размера TRUTH_N."""
+    """Estimate super-population pseudo-true parameters at sample size TRUTH_N."""
     mods = load_project_modules()
     ss = mods["scenarios_simulation"]
     ac = mods["analysis_core"]
@@ -834,7 +835,7 @@ def truth_for_variant(
 
 
 # ---------------------------------------------------------------------------
-# 5. Калибровка kappa
+# 5. Calibration of scalar multiplier kappa
 # ---------------------------------------------------------------------------
 def out_dir_for(variant: str, tag: str | None = None) -> Path:
     return OUT_DIR_SAFE / (tag or variant)
@@ -878,10 +879,10 @@ def cmd_calibrate(
     max_iter: int = 20,
 ) -> float:
     if variant == "base":
-        print("variant='base' — калибровка не нужна.", file=sys.stderr)
+        print("variant='base' does not require calibration.", file=sys.stderr)
         return 1.0
     gr = load_project_modules()["grid_runner"]
-    print(f"Калибровка kappa: variant={variant!r}, vp={vp}, lam={lam}, seeds={seeds}")
+    print(f"Calibrating kappa: variant={variant!r}, vp={vp}, lam={lam}, seeds={seeds}")
     target = float(gr.compute_truth_grid(lam, 0.0, None, gr.BASE_SHARE, seeds)["hr"])
     print(f"  target HR (base, lam={lam}): {target:.4f}")
 
@@ -904,16 +905,16 @@ def cmd_calibrate(
             hi = mid
         else:
             lo = mid
-    print(f"\nИтог: kappa = {best_kappa:.4f} (HR={best_hr:.4f}, target={target:.4f})")
+    print(f"\nResult: kappa = {best_kappa:.4f} (HR={best_hr:.4f}, target={target:.4f})")
     return best_kappa
 
 
 # ---------------------------------------------------------------------------
-# 6. Проверки: --check-base, --check-neutral, --check-csv
+# 6. Verification commands: --check-base, --check-neutral, --check-csv
 # ---------------------------------------------------------------------------
 def cmd_check_base(grid_dir: Path, reps: int, only: str) -> bool:
     gr = load_project_modules()["grid_runner"]
-    print(f"Проверка: variant='base' vs raw CSV в {grid_dir} и {HERE / 'output'} (reps={reps})")
+    print(f"Regression check: variant='base' vs raw CSVs in {grid_dir} and {HERE / 'output'} (reps={reps})")
     cells = gr.build_grid_cells()
     all_ok, n_checked = True, 0
     for c in cells:
@@ -947,14 +948,14 @@ def cmd_check_base(grid_dir: Path, reps: int, only: str) -> bool:
         print(f"  {c['name'][:45]:45s} reps={len(merged)}/{len(old)}  {status}")
         all_ok &= ok
     if n_checked == 0:
-        print(f"  ПРОПУЩЕНО: нет raw CSV ни в {grid_dir}, ни в {HERE / 'output'}")
+        print(f"  SKIPPED: no raw CSV files found in {grid_dir} or {HERE / 'output'}")
         return False
-    print("ИТОГ:", "регрессия пройдена" if all_ok else "РАСХОЖДЕНИЯ — сетке доверять нельзя")
+    print("SUMMARY:", "regression passed" if all_ok else "DISCREPANCIES DETECTED -- do not trust grid")
     return all_ok
 
 
 def cmd_check_neutral(cells: list[dict[str, Any]], reps: int) -> bool:
-    """A(gamma=0), F(rho=0), C(delta=0) при kappa=1.0 должны совпасть с base бит-в-бит."""
+    """Verify A(gamma=0), F(rho=0), and C(delta=0) at kappa=1.0 match base bit-for-bit."""
     gr = load_project_modules()["grid_runner"]
     neutral = [
         ("A", {"gamma": 0.0}),
@@ -963,11 +964,11 @@ def cmd_check_neutral(cells: list[dict[str, Any]], reps: int) -> bool:
     ]
     targets = [c for c in cells if c["v1name"] in ("S0_null", "S1_planted")]
     if not targets:
-        print("Нет S0/S1 для проверки нейтральности")
+        print("No S0_null/S1_planted anchor cells found for neutrality check.")
         return False
     all_ok = True
     for variant, vp in neutral:
-        print(f"\nneutral check: variant={variant!r}, vp={vp}")
+        print(f"\nNeutrality check: variant={variant!r}, vp={vp}")
         for c in targets:
             base_df = pd.DataFrame([gr.one_rep_grid(j) for j in gr.jobs_for(c, reps)])
             var_df = pd.DataFrame(
@@ -1001,23 +1002,23 @@ def cmd_check_neutral(cells: list[dict[str, Any]], reps: int) -> bool:
 
 
 def cmd_check_csv(csv_path: Path) -> bool:
-    """Проверяет существующий grid_summary.csv на неравенство Буля без изменения файла."""
+    """Audit an existing summary CSV against Frechet-Boole bounds without modifying it."""
     if not csv_path.exists():
-        print(f"Файл не найден: {csv_path}", file=sys.stderr)
+        print(f"File not found: {csv_path}", file=sys.stderr)
         return False
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
     issues = check_boole_dataframe(df)
     if issues:
-        print(f"НАЙДЕНЫ НАРУШЕНИЯ ИНВАРИАНТОВ в {csv_path}:")
+        print(f"INVARIANT VIOLATIONS FOUND in {csv_path}:")
         for msg in issues:
             print("  -", msg)
         return False
-    print(f"OK: проверено {len(df)} строк в {csv_path}, нарушений неравенства Буля нет.")
+    print(f"OK: audited {len(df)} rows in {csv_path}, 0 Frechet-Boole violations.")
     return True
 
 
 # ---------------------------------------------------------------------------
-# 7. --run и --list
+# 7. --run and --list
 # ---------------------------------------------------------------------------
 def cmd_list(
     cells: list[dict[str, Any]], reps: int, workers: int, variant: str, kappa: float
@@ -1025,8 +1026,8 @@ def cmd_list(
     gr = load_project_modules()["grid_runner"]
     tot = 0.0
     print(
-        f"{'индекс':>6} {'блок':<4} {'N':>4} {'lam':>4} {'solv':>5} {'rho':>5} "
-        f"{'наруш.':>7} {'PP':>3}  {'v1'}"
+        f"{'index':>6} {'blk':<4} {'N':>4} {'lam':>4} {'solv':>5} {'rho':>5} "
+        f"{'viol':>6} {'PP':>3}  {'anchor'}"
     )
     for c in cells:
         tot += float(gr.est_seconds_per_rep(c["n"])) * reps
@@ -1034,12 +1035,12 @@ def cmd_list(
             f"{c['index']:>6} {c['block']:<4} {c['n']:>4} {c['lam']:>4.1f} "
             f"{c['solv']:>5.1f} "
             f"{'' if c['rho'] is None else c['rho']:>5} "
-            f"{c['viol']:>7} {'да' if c['pp'] else '':>3}  {c['v1name'] or ''}"
+            f"{c['viol']:>6} {'yes' if c['pp'] else '':>3}  {c['v1name'] or ''}"
         )
     print(
-        f"\nЯчеек: {len(cells)}; R={reps}; variant={variant} (kappa={kappa:.3f}); "
-        f"оценка: {tot / 3600:.1f} ядро-часов, "
-        f"~ {tot / 3600 / max(workers, 1):.1f} ч на {workers} ядрах (грубо)"
+        f"\nCells: {len(cells)}; R={reps}; variant={variant} (kappa={kappa:.3f}); "
+        f"est. runtime: {tot / 3600:.1f} core-hours, "
+        f"~{tot / 3600 / max(workers, 1):.1f} h on {workers} workers (approx.)"
     )
 
 
@@ -1078,7 +1079,7 @@ def cmd_run_variant(
             continue
         if resume and path.exists():
             df = pd.read_csv(path, encoding="utf-8-sig")
-            print(f"[{k:02d}/{len(cells)}] {c['name']}: найден готовый файл, пропуск")
+            print(f"[{k:02d}/{len(cells)}] {c['name']}: existing output found, skipping")
         else:
             t1 = time.time()
             jobs = jobs_for_variant(c, reps, variant, vp, kappa, zero_solver_mode)
@@ -1090,12 +1091,12 @@ def cmd_run_variant(
             df.to_csv(path, index=False, encoding="utf-8-sig")
             print(
                 f"[{k:02d}/{len(cells)}] {c['name']}: "
-                f"{int(df['ok'].sum())}/{len(df)} реплик, {time.time() - t1:.0f} с",
+                f"{int(df['ok'].sum())}/{len(df)} reps, {time.time() - t1:.0f} s",
                 flush=True,
             )
         if int(df["ok"].sum()) == 0:
             example_err = df["error"].iloc[0] if "error" in df.columns else "?"
-            print(f"   ВНИМАНИЕ: нет успешных реплик; пример ошибки: {example_err}")
+            print(f"   WARNING: 0 successful replications; sample error: {example_err}")
             continue
         summaries.append(
             summarize_cell_safe(
@@ -1110,16 +1111,16 @@ def cmd_run_variant(
         summary_df = pd.DataFrame(summaries)
         issues = check_boole_dataframe(summary_df)
         if issues:
-            raise AssertionError("Нарушение инвариантов в итоговой сводке:\n" + "\n".join(issues))
+            raise AssertionError("Invariant violation in final summary:\n" + "\n".join(issues))
         summary_df.to_csv(out / "grid_summary.csv", index=False, encoding="utf-8-sig")
-    print(f"Готово за {(time.time() - t0) / 60:.1f} мин. Сводка: {out / 'grid_summary.csv'}")
+    print(f"Done in {(time.time() - t0) / 60:.1f} min. Summary: {out / 'grid_summary.csv'}")
 
 
 # ---------------------------------------------------------------------------
-# 8. --invariance
+# 8. --invariance (Table 5)
 # ---------------------------------------------------------------------------
 def interp_required_n(points: Iterable[tuple[float, float]], target: float) -> float | None:
-    """Интерполяция N в log-пространстве для достижения target power."""
+    """Log-linear interpolation on ln(N) to find required N for target power."""
     pts = sorted((float(n), float(p)) for n, p in points if not (np.isnan(n) or np.isnan(p)))
     if not pts:
         return None
@@ -1144,9 +1145,9 @@ def cmd_invariance(
     search_root: Path = OUT_DIR_SAFE,
     grid_dir: Path | None = None,
 ) -> bool:
-    """Таблица N_required по эндпойнту x варианту + отношение H1a/H3 при N=40."""
-    print(f"Invariance-анализ: lam={target_lam}, target power={target_power}")
-    print(f"Источник таблиц: {search_root} | теги: {list(tags)}\n")
+    """Generate cross-DGM N_required table (Table 5) and H1a/H3 power ratio at N=40."""
+    print(f"Cross-DGM invariance analysis: lam={target_lam}, target power={target_power}")
+    print(f"Summary root: {search_root} | tags: {list(tags)}\n")
 
     summaries: dict[str, pd.DataFrame] = {}
     for tag in tags:
@@ -1156,12 +1157,12 @@ def cmd_invariance(
             if alt_base.exists():
                 path = alt_base
         if not path.exists():
-            print(f"  [SKIP] {tag}: нет {path}")
+            print(f"  [SKIP] {tag}: missing {path}")
             continue
         df = pd.read_csv(path, encoding="utf-8-sig")
         issues = check_boole_dataframe(df)
         if issues:
-            print(f"  [FAIL] {tag}: нарушения Буля в {path}:")
+            print(f"  [FAIL] {tag}: Frechet-Boole violations in {path}:")
             for msg in issues[:3]:
                 print(f"         {msg}")
             return False
@@ -1175,16 +1176,16 @@ def cmd_invariance(
             mask &= df["rho"].isna()
         df_sub = df[mask].sort_values("N")
         if df_sub.empty:
-            print(f"  [SKIP] {tag}: нет ячеек block=A, lam={target_lam}")
+            print(f"  [SKIP] {tag}: no Block A cells for lam={target_lam}")
             continue
         summaries[tag] = df_sub
-        print(f"  {tag:20s}: ячеек N = {sorted(df_sub['N'].unique().tolist())}")
+        print(f"  {tag:20s}: N grid = {sorted(df_sub['N'].unique().tolist())}")
 
     if not summaries:
-        print("\nНечего анализировать. Сначала прогоните --run или укажите --invariance-dir.")
+        print("\nNothing to analyze. Run --run first or specify --invariance-dir.")
         return False
 
-    print(f"\nТаблица 6 (N_required для power >= {target_power}):")
+    print(f"\nTable 5 (N_required for power >= {target_power}):")
     header = f"{'Endpoint':<10} " + " ".join(f"{t:>12s}" for t in summaries)
     print(header)
     print("-" * len(header))
@@ -1194,7 +1195,7 @@ def cmd_invariance(
         n_req: dict[str, float | None] = {}
         for tag, df in summaries.items():
             if col not in df.columns:
-                raise KeyError(f"В {tag} отсутствует обязательный столбец {col!r}")
+                raise KeyError(f"Tag {tag!r} is missing required column {col!r}")
             n_req[tag] = interp_required_n(zip(df["N"], df[col]), target_power)
         vals = [v for v in n_req.values() if v is not None]
         max_dev = (
@@ -1203,9 +1204,9 @@ def cmd_invariance(
             else float("nan")
         )
         cells_str = " ".join(
-            f"{'—':>12s}" if v is None else f"{v:12.1f}" for v in n_req.values()
+            f"{'--':>12s}" if v is None else f"{v:12.1f}" for v in n_req.values()
         )
-        dev_str = "—" if np.isnan(max_dev) else f"{max_dev:.1f}%"
+        dev_str = "--" if np.isnan(max_dev) else f"{max_dev:.2f}%"
         print(f"{ep_name:<10} {cells_str}   max_dev={dev_str}")
         rows_out.append(
             {
@@ -1217,7 +1218,7 @@ def cmd_invariance(
             }
         )
 
-    print("\nОтношение Power(H1a) / Power(H3_trans) при N=40 (структурная подпись Power Dilemma):")
+    print("\nPower(H1a) / Power(H3_trans) ratio at N=40 (endpoint power asymmetry):")
     ratios: dict[str, float] = {}
     for tag, df in summaries.items():
         row_n40 = df[df["N"] == 40]
@@ -1232,21 +1233,21 @@ def cmd_invariance(
         vals = list(ratios.values())
         print("  " + "  ".join(f"{tag}={v:.2f}" for tag, v in ratios.items()))
         print(
-            f"  среднее = {np.mean(vals):.2f}, SD = {np.std(vals):.2f}, "
+            f"  mean = {np.mean(vals):.2f}, SD = {np.std(vals):.2f}, "
             f"min = {min(vals):.2f}, max = {max(vals):.2f}"
         )
     else:
-        print("  (нет данных при N=40 или Power(H3_trans) == 0)")
+        print("  (no data at N=40 or Power(H3_trans) == 0)")
 
     search_root.mkdir(parents=True, exist_ok=True)
     out_path = search_root / f"invariance_lam{target_lam:.2f}.csv"
     pd.DataFrame(rows_out).to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\nТаблица сохранена: {out_path}")
+    print(f"\nSaved invariance table: {out_path}")
     return True
 
 
 # ---------------------------------------------------------------------------
-# 9. --quickstart (учитывает ВСЕ 4 пилотных эффекта)
+# 9. --quickstart (incorporates all 4 pilot effects)
 # ---------------------------------------------------------------------------
 def make_params_from_pilot(
     n: int,
@@ -1254,7 +1255,7 @@ def make_params_from_pilot(
     ai_red_explicit: float,
     share: float,
 ) -> dict[str, Any]:
-    """Строит словарь параметров P напрямую из всех 4 пилотных эффектов."""
+    """Construct parameter dict P directly from all four user-supplied pilot effects."""
     mods = load_project_modules()
     ss = mods["scenarios_simulation"]
     gr = mods["grid_runner"]
@@ -1290,7 +1291,7 @@ def calibrate_pilot_reduction(
     tol: float = 0.01,
     max_iter: int = 16,
 ) -> tuple[float, dict[str, float]]:
-    """Подбирает ai_time_reduction['explicit'] по бисекции под pilot['hr']."""
+    """Solve via bisection for ai_time_reduction['explicit'] matching pilot['hr']."""
     target_hr = float(pilot["hr"])
     lo, hi = 0.0, 0.94
 
@@ -1330,29 +1331,29 @@ def cmd_quickstart(
     target_power: float,
     workers: int,
 ) -> bool:
-    """Рассчитывает N_required по всем 4 пилотным эффектам пользователя."""
+    """Estimate endpoint-specific and joint N_required from four user-supplied pilot effects."""
     gr = load_project_modules()["grid_runner"]
     share = float(gr.BASE_SHARE)
 
     print(f"Quickstart: variant={variant!r}, vp={vp}, kappa={kappa:.3f}, R={reps}")
     print(
-        f"Пилотные эффекты: HR={pilot['hr']:.2f}, d_EL={pilot['d_el']:+.2f}, "
+        f"Pilot effects: HR={pilot['hr']:.2f}, d_EL={pilot['d_el']:+.2f}, "
         f"d_GL={pilot['d_gl']:+.2f}, d_trans={pilot['d_trans']:+.2f}"
     )
 
     if pilot["hr"] <= 1.0:
-        print("  ПРЕДУПРЕЖДЕНИЕ: H1a проверяет ускорение (HR > 1). При HR <= 1 мощность будет ~0.")
+        print("  WARNING: H1a tests speedup (HR > 1). Power will be ~0 when HR <= 1.")
     if pilot["d_el"] >= 0.0:
-        print("  ПРЕДУПРЕЖДЕНИЕ: H2a проверяет снижение EL (d_EL < 0). При d_EL >= 0 мощность будет ~0.")
+        print("  WARNING: H2a tests lower EL (d_EL < 0). Power will be ~0 when d_EL >= 0.")
     if pilot["d_gl"] >= 0.0:
-        print("  ПРЕДУПРЕЖДЕНИЕ: H2b проверяет снижение GL (d_GL < 0). При d_GL >= 0 мощность будет ~0.")
+        print("  WARNING: H2b tests lower GL (d_GL < 0). Power will be ~0 when d_GL >= 0.")
     if pilot["d_trans"] >= 0.0:
-        print("  ПРЕДУПРЕЖДЕНИЕ: H3 проверяет снижение Transfer (d_trans < 0). При d_trans >= 0 мощность будет ~0.")
+        print("  WARNING: H3 tests lower Transfer (d_trans < 0). Power will be ~0 when d_trans >= 0.")
 
-    print("\nКалибровка ai_time_reduction под пилотный HR...")
+    print("\nCalibrating ai_time_reduction['explicit'] to match pilot HR...")
     red_star, truth = calibrate_pilot_reduction(pilot, variant, vp, kappa, share, seeds=(777,))
     print(
-        f"  Подобрано ai_time_reduction['explicit'] = {red_star:.4f} -> "
+        f"  Calibrated ai_time_reduction['explicit'] = {red_star:.4f} -> "
         f"true HR={truth['hr']:.3f}, EL_diff={truth['el_diff']:+.2f}, "
         f"GL_diff={truth['gl_diff']:+.2f}, Trans_b={truth['tr_b']:+.2f}\n"
     )
@@ -1393,7 +1394,7 @@ def cmd_quickstart(
         )
 
     df_res = pd.DataFrame(results)
-    print(f"\nN_required (power >= {target_power}) по вашим пилотным эффектам:")
+    print(f"\nRequired total sample size N_req (power >= {target_power}):")
     out_req: dict[str, Any] = {
         "pilot_hr": pilot["hr"],
         "pilot_d_el": pilot["d_el"],
@@ -1404,22 +1405,22 @@ def cmd_quickstart(
     for ep, col in ENDPOINT_COLS.items():
         n_req = interp_required_n(zip(df_res["N"], df_res[col]), target_power)
         out_req[f"N_req_{ep}"] = n_req
-        print(f"  {ep:<10}: {'— (N > 160)' if n_req is None else f'{n_req:.0f}'}")
+        print(f"  {ep:<10}: {'> 160' if n_req is None else f'{n_req:.1f}'}")
 
     OUT_DIR_SAFE.mkdir(parents=True, exist_ok=True)
     df_res.to_csv(OUT_DIR_SAFE / "quickstart_grid.csv", index=False, encoding="utf-8-sig")
     out_path = OUT_DIR_SAFE / "quickstart_result.csv"
     pd.DataFrame([out_req]).to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"\nСохранено: {out_path} и {OUT_DIR_SAFE / 'quickstart_grid.csv'}")
+    print(f"\nSaved: {out_path} and {OUT_DIR_SAFE / 'quickstart_grid.csv'}")
     return True
 
 
 # ---------------------------------------------------------------------------
-# 10. Встроенные тесты (--selftest)
+# 10. Built-in self-tests (--selftest)
 # ---------------------------------------------------------------------------
 def run_selftest() -> bool:
-    """Набор assert-тестов на критическую логику и граничные случаи."""
-    print("Запуск встроенных тестов variant_runner_safe.py...")
+    """Assertion suite verifying core invariants and numerical edge cases."""
+    print("Running built-in self-tests for variant_runner_safe.py...")
 
     ok_df = pd.DataFrame(
         [
@@ -1433,7 +1434,7 @@ def run_selftest() -> bool:
             }
         ]
     )
-    assert check_boole_dataframe(ok_df) == [], "Корректная строка не должна давать ошибку"
+    assert check_boole_dataframe(ok_df) == [], "Valid row should not trigger a Boole error"
 
     bad_df = pd.DataFrame(
         [
@@ -1448,8 +1449,8 @@ def run_selftest() -> bool:
         ]
     )
     errs = check_boole_dataframe(bad_df)
-    assert len(errs) == 1 and "0.8890" in errs[0], f"Ошибка Буля не обнаружена: {errs}"
-    print("  [OK 1/4] Проверка неравенства Буля (валидный и нарушенный случаи).")
+    assert len(errs) == 1 and "0.8890" in errs[0], f"Boole violation not detected: {errs}"
+    print("  [OK 1/5] Frechet-Boole bounds audit (valid and violating cases).")
 
     check_calibration_bracket(1.1, 3.2, 1.8, 0.1, 4.0)
     raised = False
@@ -1457,37 +1458,37 @@ def run_selftest() -> bool:
         check_calibration_bracket(1.1, 1.5, 2.2, 0.1, 4.0)
     except ValueError:
         raised = True
-    assert raised, "check_calibration_bracket обязан падать, если target вне [lo, hi]"
-    print("  [OK 2/4] Защита границ бисекции при калибровке kappa / HR.")
+    assert raised, "check_calibration_bracket must raise ValueError when target is outside [lo, hi]"
+    print("  [OK 2/5] Bisection bracket guard for kappa / HR calibration.")
 
     rng = np.random.default_rng(42)
     z = rng.normal(0.0, 1.0, size=200_000)
     w_m = weibull_mult(z)
     t_m = studentt_mult(z, df=4.0, target_log_sd=0.45)
-    assert abs(float(np.median(w_m)) - 1.0) < 0.01, "Медиана Weibull отклонилась от 1"
-    assert abs(float(np.std(np.log(w_m))) - 0.45) < 0.01, "log-SD Weibull отклонился от 0.45"
-    assert abs(float(np.median(t_m)) - 1.0) < 0.01, "Медиана Student-t отклонилась от 1"
-    assert abs(float(np.std(np.log(t_m))) - 0.45) < 0.015, "log-SD Student-t отклонился от 0.45"
-    print("  [OK 3/4] Статистические свойства преобразований Weibull и Student-t.")
+    assert abs(float(np.median(w_m)) - 1.0) < 0.01, "Weibull median deviated from 1"
+    assert abs(float(np.std(np.log(w_m))) - 0.45) < 0.01, "Weibull log-SD deviated from 0.45"
+    assert abs(float(np.median(t_m)) - 1.0) < 0.01, "Student-t median deviated from 1"
+    assert abs(float(np.std(np.log(t_m))) - 0.45) < 0.015, "Student-t log-SD deviated from 0.45"
+    print("  [OK 3/5] Distributional properties of Weibull and Student-t transforms.")
 
     pts = [(40, 0.50), (80, 0.80), (120, 0.95)]
     n_req = interp_required_n(pts, 0.80)
-    assert n_req is not None and abs(n_req - 80.0) < 1e-9, f"Неверная интерполяция: {n_req}"
-    assert interp_required_n(pts, 0.99) is None, "При недостижении target должен возвращаться None"
-    assert interp_required_n(pts, 0.40) == 40.0, "При старте выше target должно возвращаться min N"
-    print("  [OK 4/4] Интерполяция N_required и маппинг ENDPOINT_COLS.")
+    assert n_req is not None and abs(n_req - 80.0) < 1e-9, f"Incorrect interpolation: {n_req}"
+    assert interp_required_n(pts, 0.99) is None, "Unreachable target should return None"
+    assert interp_required_n(pts, 0.40) == 40.0, "Target below starting power should return min N"
+    print("  [OK 4/5] Log-linear N_required interpolation and ENDPOINT_COLS mapping.")
 
-    # Тест 5: защита от нулевого времени в левом хвосте Student-t
+    # Test 5: guard against 0-second floor in extreme left tail of Student-t
     t_extreme = studentt_mult(-4.5, df=4.0, target_log_sd=0.45)
     sec_extreme = max(1, int(round(0.30 * float(t_extreme) * 60)))
     assert sec_extreme >= 1 and np.isfinite(np.log(round(sec_extreme / 60.0, 3)))
-    print("  [OK 5/5] Защита от time_min == 0 (ln(0) = -inf) в хвосте Student-t.")
-    print("ВСЕ ВСТРОЕННЫЕ ТЕСТЫ ПРОЙДЕНЫ.")
+    print("  [OK 5/5] 1-second lower floor preventing ln(0) = -inf in Student-t tail.")
+    print("ALL BUILT-IN SELF-TESTS PASSED.")
     return True
 
 
 # ---------------------------------------------------------------------------
-# 11. CLI-аргументы и точка входа
+# 11. CLI arguments and entry point
 # ---------------------------------------------------------------------------
 def parse_vp(raw: str) -> dict[str, float]:
     out: dict[str, float] = {}
@@ -1498,7 +1499,7 @@ def parse_vp(raw: str) -> dict[str, float]:
         if not part:
             continue
         if "=" not in part:
-            raise ValueError(f"--vp: ожидается формат key=val, получено {part!r}")
+            raise ValueError(f"--vp expects 'key=val' pairs, got {part!r}")
         k, v = part.split("=", 1)
         out[k.strip()] = float(v.strip())
     return out
@@ -1521,47 +1522,47 @@ def build_vp(variant: str, args: argparse.Namespace) -> dict[str, float]:
 def main() -> int:
     warnings.filterwarnings("ignore")
     ap = argparse.ArgumentParser(
-        description="Безопасный раннер вариантов (W/A/F/C/T) и аудитор инвариантов без правки v1",
+        description="Self-contained runner for alternative DGMs (W/A/F/C/T), invariant auditor, and --quickstart planner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--selftest", action="store_true", help="запустить встроенные assert-тесты")
-    ap.add_argument("--check-csv", type=str, default="", help="проверить готовый grid_summary.csv на неравенство Буля")
-    ap.add_argument("--list", action="store_true", help="список ячеек и оценка времени")
-    ap.add_argument("--check-base", action="store_true", help="сверка base vs raw CSV")
-    ap.add_argument("--check-neutral", action="store_true", help="проверка нейтральности A(0)/F(0)/C(0)")
-    ap.add_argument("--calibrate", action="store_true", help="подобрать kappa по true HR")
-    ap.add_argument("--run", action="store_true", help="запустить прогон варианта")
-    ap.add_argument("--invariance", action="store_true", help="построить Table 6 по готовым grid_summary.csv")
-    ap.add_argument("--quickstart", action="store_true", help="рассчитать N_required по всем 4 пилотным эффектам")
+    ap.add_argument("--selftest", action="store_true", help="run built-in assertion tests")
+    ap.add_argument("--check-csv", type=str, default="", help="audit a summary CSV against Frechet-Boole bounds")
+    ap.add_argument("--list", action="store_true", help="list grid cells and estimated runtime")
+    ap.add_argument("--check-base", action="store_true", help="regression-check base variant against raw CSVs")
+    ap.add_argument("--check-neutral", action="store_true", help="verify neutrality of A(0)/F(0)/C(0) vs base")
+    ap.add_argument("--calibrate", action="store_true", help="calibrate kappa to match baseline true HR")
+    ap.add_argument("--run", action="store_true", help="run simulation grid for the selected variant")
+    ap.add_argument("--invariance", action="store_true", help="build Table 5 invariance summary from grid_summary.csv files")
+    ap.add_argument("--quickstart", action="store_true", help="compute N_required from four pilot effect sizes")
 
     ap.add_argument("--variant", default="base", choices=ALL_VARIANTS)
-    ap.add_argument("--gamma", type=float, default=None, help="variant A: gamma")
-    ap.add_argument("--rho-speed", type=float, default=None, help="variant F: rho speed<->ability")
-    ap.add_argument("--delta", type=float, default=None, help="variant C: delta")
-    ap.add_argument("--df", type=float, default=None, help="variant T: df (по умолчанию 4.0)")
-    ap.add_argument("--vp", default="", help="переопределения 'k=v,k2=v2'")
-    ap.add_argument("--kappa", type=float, default=None, help="kappa (иначе из kappa.json)")
+    ap.add_argument("--gamma", type=float, default=None, help="variant A: ATI slope gamma")
+    ap.add_argument("--rho-speed", type=float, default=None, help="variant F: speed-ability correlation rho")
+    ap.add_argument("--delta", type=float, default=None, help="variant C: EG abandonment shift delta")
+    ap.add_argument("--df", type=float, default=None, help="variant T: Student-t degrees of freedom (default 4.0)")
+    ap.add_argument("--vp", default="", help="comma-separated variant parameter overrides 'k=v,k2=v2'")
+    ap.add_argument("--kappa", type=float, default=None, help="override kappa (otherwise read from kappa.json)")
     ap.add_argument(
         "--zero-solver",
         choices=("inherit", "off"),
         default="inherit",
-        help="inherit = поведение v1; off = отключить искусственного zero_solver во всех ячейках",
+        help="inherit = baseline behavior; off = disable zero_solver in all cells",
     )
 
     ap.add_argument("--calibrate-lam", type=float, default=0.6)
-    ap.add_argument("--seeds", default="777", help="seeds для калибровки, через запятую")
+    ap.add_argument("--seeds", default="777", help="comma-separated super-population seeds for calibration")
     ap.add_argument("--reps", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=max(1, os.cpu_count() or 1))
-    ap.add_argument("--grid-dir", type=str, default="", help="папка с grid_raw_*.csv / grid_summary.csv")
-    ap.add_argument("--invariance-dir", type=str, default="", help="корневая папка тегов для --invariance")
+    ap.add_argument("--grid-dir", type=str, default="", help="directory containing baseline grid_raw_*.csv / grid_summary.csv")
+    ap.add_argument("--invariance-dir", type=str, default="", help="root directory of variant tags for --invariance")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--only", default="")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--tag", default=None)
 
-    ap.add_argument("--variants", default="", help="список тегов через запятую для --invariance")
-    ap.add_argument("--lam", type=float, default=0.6, help="lam для Table 6 (по умолчанию 0.6)")
-    ap.add_argument("--power", type=float, default=0.80, help="целевая мощность (по умолчанию 0.80)")
+    ap.add_argument("--variants", default="", help="comma-separated tag list for --invariance")
+    ap.add_argument("--lam", type=float, default=0.6, help="lambda level for Table 5 (default 0.6)")
+    ap.add_argument("--power", type=float, default=0.80, help="target power level (default 0.80)")
 
     ap.add_argument("--pilot-hr", type=float, default=1.80)
     ap.add_argument("--pilot-d-el", type=float, default=-0.40)
@@ -1611,7 +1612,7 @@ def main() -> int:
             if (grid_dir / "grid_summary.csv").exists() and "base" not in tags:
                 tags = ["base", *tags]
         if not tags:
-            print(f"Нет готовых grid_summary.csv в {inv_root}", file=sys.stderr)
+            print(f"No grid_summary.csv files found in {inv_root}", file=sys.stderr)
             return 1
         rc |= 0 if cmd_invariance(tags, args.lam, args.power, inv_root, grid_dir) else 1
 
@@ -1649,27 +1650,27 @@ def main() -> int:
 
         if args.calibrate:
             if args.variant == "base":
-                print("variant='base' — калибровка не нужна.", file=sys.stderr)
+                print("variant='base' does not require calibration.", file=sys.stderr)
                 rc |= 1
             else:
                 kappa = cmd_calibrate(args.variant, vp, args.calibrate_lam, seeds=seeds)
                 save_kappa(args.variant, vp, kappa, args.tag)
-                print(f"kappa сохранён: {kappa_file(args.variant, args.tag)}")
+                print(f"Saved kappa: {kappa_file(args.variant, args.tag)}")
 
         if args.run:
             if args.variant == "base":
                 print(
-                    "Для variant='base' запускайте grid_runner.py --run.",
+                    "For variant='base', run grid_runner.py --run directly.",
                     file=sys.stderr,
                 )
                 rc |= 1
             else:
                 kappa = args.kappa if args.kappa is not None else load_kappa(args.variant, args.tag)
                 if kappa is None:
-                    print("kappa не задан — запускаю калибровку...", file=sys.stderr)
+                    print("kappa not set -- running calibration...", file=sys.stderr)
                     kappa = cmd_calibrate(args.variant, vp, args.calibrate_lam, seeds=(777,))
                     save_kappa(args.variant, vp, kappa, args.tag)
-                print(f"Использую kappa = {kappa:.4f} | zero_solver = {args.zero_solver}")
+                print(f"Using kappa = {kappa:.4f} | zero_solver = {args.zero_solver}")
                 cmd_run_variant(
                     cells,
                     reps,
